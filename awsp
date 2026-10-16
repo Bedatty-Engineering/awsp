@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+# Manage AWS CLI profiles and emit shell updates for the calling terminal.
+
+set -o pipefail
+
+AWSP_SHELL_OUTPUT=0
+
+awsp_fail() {
+  printf 'awsp: %s\n' "$*" >&2
+  return 1
+}
+
+awsp_require_aws() {
+  command -v aws >/dev/null 2>&1 || awsp_fail 'AWS CLI (aws) was not found in PATH.'
+}
+
+awsp_profiles() {
+  aws configure list-profiles
+}
+
+awsp_shell_value() {
+  printf '%q' "$1"
+}
+
+awsp_emit_profile() {
+  local profile="$1" region
+  region=$(aws configure get region --profile "$profile" 2>/dev/null || true)
+  printf 'export AWS_PROFILE=%s\n' "$(awsp_shell_value "$profile")"
+  if [[ -n "$region" ]]; then
+    printf 'export AWS_REGION=%s\n' "$(awsp_shell_value "$region")"
+    printf 'export AWS_DEFAULT_REGION=%s\n' "$(awsp_shell_value "$region")"
+  else
+    printf 'unset AWS_REGION AWS_DEFAULT_REGION\n'
+  fi
+}
+
+awsp_select_profile() {
+  command -v fzf >/dev/null 2>&1 || {
+    awsp_fail 'fzf was not found. Use: awsp use <profile>'
+    return 1
+  }
+  awsp_profiles | fzf \
+    --prompt='  ' \
+    --header='AWS Profile Switcher' \
+    --header-first \
+    --layout=reverse \
+    --height='~40%' \
+    --min-height=10 \
+    --border=rounded \
+    --border-label=' awsp ' \
+    --padding=1 \
+    --margin=1 \
+    --pointer='>' \
+    --color='header:cyan:bold,border:cyan,label:cyan:bold,pointer:cyan:bold,prompt:cyan' \
+    --preview='printf "Profile: %s\n---\n" {}; aws configure get region --profile {} 2>/dev/null; aws configure get sso_start_url --profile {} 2>/dev/null | sed "s|^|SSO: |" || printf "(no SSO)\n"' \
+    --preview-label=' profile details ' \
+    --preview-window=right,40%,border-left
+}
+
+awsp_switch_profile() {
+  local profile="$1" region has_sso
+  if ! awsp_profiles | grep -Fxq "$profile"; then
+    awsp_fail "Profile not found: $profile"
+    return 1
+  fi
+
+  region=$(aws configure get region --profile "$profile" 2>/dev/null || true)
+  if ! aws sts get-caller-identity --profile "$profile" --query 'Arn' --output text >/dev/null 2>&1; then
+    has_sso=$(aws configure get sso_start_url --profile "$profile" 2>/dev/null || \
+      aws configure get sso_session --profile "$profile" 2>/dev/null || true)
+    if [[ -n "$has_sso" ]]; then
+      printf 'SSO session missing or expired. Logging in to %s...\n' "$profile" >&2
+      aws sso login --profile "$profile" >&2 || return $?
+      if ! aws sts get-caller-identity --profile "$profile" --query 'Arn' --output text >/dev/null 2>&1; then
+        awsp_fail "AWS STS authentication failed for profile '$profile'."
+        return 1
+      fi
+    else
+      awsp_fail "Credentials not ready for '$profile'."
+      return 1
+    fi
+  fi
+
+  export AWS_PROFILE="$profile"
+  if [[ -n "$region" ]]; then
+    export AWS_REGION="$region"
+    export AWS_DEFAULT_REGION="$region"
+  else
+    unset AWS_REGION AWS_DEFAULT_REGION
+  fi
+
+  if [[ "$AWSP_SHELL_OUTPUT" -eq 1 ]]; then
+    awsp_emit_profile "$profile"
+    printf 'Switched to AWS profile: %s\n' "$profile" >&2
+  else
+    awsp_emit_profile "$profile"
+    printf 'Profile selected: %s\n' "$profile" >&2
+    printf 'To update this shell, source the awsp shell integration or run: eval "$(awsp use %s)"\n' "$profile" >&2
+  fi
+}
+
+awsp_clear_profile() {
+  printf 'unset AWS_PROFILE AWS_REGION AWS_DEFAULT_REGION\n'
+  if [[ "$AWSP_SHELL_OUTPUT" -eq 0 ]]; then
+    printf 'AWS profile cleared in this process; use the shell integration to clear the current shell.\n' >&2
+  fi
+}
+
+awsp_logout() {
+  printf 'Logging out of all AWS SSO sessions...\n' >&2
+  aws sso logout >&2 || return $?
+  printf 'unset AWS_PROFILE AWS_REGION AWS_DEFAULT_REGION\n'
+  if [[ "$AWSP_SHELL_OUTPUT" -eq 0 ]]; then
+    printf 'SSO sessions cleared in this process; use the shell integration to clear the current shell.\n' >&2
+  fi
+}
+
+awsp_status() {
+  local arn
+  if [[ -n "${AWS_PROFILE:-}" ]]; then
+    printf 'Current profile: %s\n' "$AWS_PROFILE"
+  else
+    printf 'Current profile: default\n'
+  fi
+  if arn=$(aws sts get-caller-identity --query 'Arn' --output text 2>/dev/null); then
+    printf 'STS: authenticated as %s\n' "$arn"
+    return 0
+  fi
+  printf 'STS: not authenticated (token missing/expired or profile invalid).\n'
+  return 1
+}
+
+awsp_usage() {
+  cat <<'EOF'
+Usage:
+  awsp                          Choose a profile with fzf
+  awsp use <profile>            Switch to a specific profile
+  awsp list                     List configured profiles
+  awsp status                   Show current profile and STS auth status
+  awsp login [profile]          Start SSO login for a profile
+  awsp logout                   Log out of all AWS SSO sessions
+  awsp clear                    Clear AWS_PROFILE and region variables
+  awsp help                     Show this help
+
+Install the shell integration and add its printed source command to your shell startup file.
+
+Without shell integration, apply a switch with:
+  eval "$(awsp use <profile>)"
+
+AWS profile configuration and credentials stay in the AWS CLI config files.
+EOF
+}
+
+main() {
+  local command profile login_target
+  if [[ "${1:-}" == '--shell-output' ]]; then
+    AWSP_SHELL_OUTPUT=1
+    shift
+  fi
+  command="${1:-select}"
+  profile="${2:-}"
+
+  case "$command" in
+    help|-h|--help) awsp_usage; return 0 ;;
+  esac
+  awsp_require_aws || return 1
+
+  case "$command" in
+    select)
+      profile=$(awsp_select_profile) || {
+        [[ "$AWSP_SHELL_OUTPUT" -eq 1 ]] || printf 'No profile selected.\n' >&2
+        return 1
+      }
+      [[ -n "$profile" ]] || { awsp_fail 'No profile selected.'; return 1; }
+      awsp_switch_profile "$profile"
+      ;;
+    use)
+      [[ -n "$profile" ]] || { awsp_fail 'Usage: awsp use <profile>'; return 1; }
+      awsp_switch_profile "$profile"
+      ;;
+    list) awsp_profiles; return $? ;;
+    status) awsp_status; return $? ;;
+    login)
+      login_target="${profile:-${AWS_PROFILE:-}}"
+      [[ -n "$login_target" ]] || {
+        awsp_fail 'Usage: awsp login <profile> (or set AWS_PROFILE first)'
+        return 1
+      }
+      aws sso login --profile "$login_target"
+      ;;
+    logout) awsp_logout ;;
+    clear) awsp_clear_profile ;;
+    *) awsp_fail "Unknown command: $command (try: awsp help)"; return 1 ;;
+  esac
+}
+
+main "$@"
